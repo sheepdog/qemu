@@ -29,6 +29,7 @@
 #define SD_OP_RELEASE_VDI    0x13
 #define SD_OP_GET_VDI_INFO   0x14
 #define SD_OP_READ_VDIS      0x15
+#define SD_OP_FLUSH_VDI      0x16
 
 #define SD_FLAG_CMD_WRITE    0x01
 #define SD_FLAG_CMD_COW      0x02
@@ -261,6 +262,7 @@ typedef struct AIOReq {
 enum AIOCBState {
     AIOCB_WRITE_UDATA,
     AIOCB_READ_UDATA,
+    AIOCB_FLUSH_CACHE,
 };
 
 struct SheepdogAIOCB {
@@ -813,6 +815,9 @@ static void coroutine_fn aio_read_response(void *opaque)
     acb = aio_req->aiocb;
 
     switch (acb->aiocb_type) {
+    case AIOCB_FLUSH_CACHE:
+        printf("rsp.result = %d\n", rsp.result);
+        break;
     case AIOCB_WRITE_UDATA:
         if (!is_data_obj(aio_req->oid)) {
             break;
@@ -1084,7 +1089,11 @@ static int coroutine_fn add_aio_request(BDRVSheepdogState *s, AIOReq *aio_req,
 
     memset(&hdr, 0, sizeof(hdr));
 
-    if (aiocb_type == AIOCB_READ_UDATA) {
+    if (aiocb_type == AIOCB_FLUSH_CACHE) {
+        wlen = 0;
+        hdr.opcode = SD_OP_FLUSH_VDI;
+        hdr.flags = SD_FLAG_CMD_WRITE | flags;
+    } else if (aiocb_type == AIOCB_READ_UDATA) {
         wlen = 0;
         hdr.opcode = SD_OP_READ_OBJ;
         hdr.flags = flags;
@@ -1771,6 +1780,31 @@ static int sd_co_readv(BlockDriverState *bs, int64_t sector_num,
     return acb->ret;
 }
 
+static int sd_co_flush_to_disk(BlockDriverState *bs)
+{
+    BDRVSheepdogState *s = bs->opaque;
+    SheepdogInode *inode = &s->inode;
+    SheepdogAIOCB *acb;
+    AIOReq *aio_req;
+    int ret;
+
+    acb = sd_aio_setup(bs, NULL, 0, 0, NULL, NULL);
+    acb->aiocb_type = AIOCB_FLUSH_CACHE;
+    acb->aio_done_func = sd_finish_aiocb;
+
+    aio_req = alloc_aio_req(s, acb, inode->vdi_id, 0, 0, 0, 0, 0);
+
+    ret = add_aio_request(s, aio_req, NULL, 0, 0,  acb->aiocb_type);
+    if (ret < 0) {
+        free_aio_req(s, aio_req);
+        qemu_aio_release(acb);
+        return ret;
+    }
+
+    qemu_coroutine_yield();
+    return acb->ret;
+}
+
 static int sd_snapshot_create(BlockDriverState *bs, QEMUSnapshotInfo *sn_info)
 {
     BDRVSheepdogState *s = bs->opaque;
@@ -2100,6 +2134,7 @@ BlockDriver bdrv_sheepdog = {
 
     .bdrv_co_readv  = sd_co_readv,
     .bdrv_co_writev = sd_co_writev,
+    .bdrv_co_flush_to_disk  = sd_co_flush_to_disk,
 
     .bdrv_snapshot_create   = sd_snapshot_create,
     .bdrv_snapshot_goto     = sd_snapshot_goto,
