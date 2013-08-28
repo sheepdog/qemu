@@ -268,6 +268,7 @@ typedef struct AIOReq {
     uint64_t offset;
     unsigned int data_len;
     uint8_t flags;
+    bool create;
     uint32_t id;
 
     QLIST_ENTRY(AIOReq) aio_siblings;
@@ -389,7 +390,7 @@ static const char * sd_strerror(int err)
 
 static inline AIOReq *alloc_aio_req(BDRVSheepdogState *s, SheepdogAIOCB *acb,
                                     uint64_t oid, unsigned int data_len,
-                                    uint64_t offset, uint8_t flags,
+                                    uint64_t offset, uint8_t flags, bool create,
                                     uint64_t base_oid, unsigned int iov_offset)
 {
     AIOReq *aio_req;
@@ -402,6 +403,7 @@ static inline AIOReq *alloc_aio_req(BDRVSheepdogState *s, SheepdogAIOCB *acb,
     aio_req->offset = offset;
     aio_req->data_len = data_len;
     aio_req->flags = flags;
+    aio_req->create = create;
     aio_req->id = s->aioreq_seq_num++;
 
     acb->nr_pending++;
@@ -660,8 +662,8 @@ static int do_req(int sockfd, SheepdogReq *hdr, void *data,
 }
 
 static void coroutine_fn add_aio_request(BDRVSheepdogState *s, AIOReq *aio_req,
-                           struct iovec *iov, int niov, bool create,
-                           enum AIOCBState aiocb_type);
+                                         struct iovec *iov, int niov,
+                                         enum AIOCBState aiocb_type);
 static void coroutine_fn resend_aioreq(BDRVSheepdogState *s, AIOReq *aio_req);
 static int reload_inode(BDRVSheepdogState *s, uint32_t snapid, const char *tag);
 static int get_sheep_fd(BDRVSheepdogState *s);
@@ -694,7 +696,7 @@ static void coroutine_fn send_pending_req(BDRVSheepdogState *s, uint64_t oid)
         /* move aio_req from pending list to inflight one */
         QLIST_REMOVE(aio_req, aio_siblings);
         QLIST_INSERT_HEAD(&s->inflight_aio_head, aio_req, aio_siblings);
-        add_aio_request(s, aio_req, acb->qiov->iov, acb->qiov->niov, false,
+        add_aio_request(s, aio_req, acb->qiov->iov, acb->qiov->niov,
                         acb->aiocb_type);
     }
 }
@@ -789,7 +791,7 @@ static void coroutine_fn aio_read_response(void *opaque)
         }
         idx = data_oid_to_idx(aio_req->oid);
 
-        if (s->inode.data_vdi_id[idx] != s->inode.vdi_id) {
+        if (aio_req->create) {
             /*
              * If the object is newly created one, we need to update
              * the vdi object (metadata object).  min_dirty_data_idx
@@ -1117,7 +1119,7 @@ out:
 }
 
 static void coroutine_fn add_aio_request(BDRVSheepdogState *s, AIOReq *aio_req,
-                           struct iovec *iov, int niov, bool create,
+                           struct iovec *iov, int niov,
                            enum AIOCBState aiocb_type)
 {
     int nr_copies = s->inode.nr_copies;
@@ -1128,6 +1130,7 @@ static void coroutine_fn add_aio_request(BDRVSheepdogState *s, AIOReq *aio_req,
     unsigned int datalen = aio_req->data_len;
     uint64_t offset = aio_req->offset;
     uint8_t flags = aio_req->flags;
+    bool create = aio_req->create;
     uint64_t old_oid = aio_req->base_oid;
 
     if (!nr_copies) {
@@ -1311,6 +1314,7 @@ static bool check_simultaneous_create(BDRVSheepdogState *s, AIOReq *aio_req)
              */
             DPRINTF("simultaneous create to %" PRIx64 "\n", aio_req->oid);
             aio_req->flags = 0;
+            aio_req->create = false;
             aio_req->base_oid = 0;
             QLIST_REMOVE(aio_req, aio_siblings);
             QLIST_INSERT_HEAD(&s->pending_aio_head, aio_req, aio_siblings);
@@ -1324,7 +1328,8 @@ static bool check_simultaneous_create(BDRVSheepdogState *s, AIOReq *aio_req)
 static void coroutine_fn resend_aioreq(BDRVSheepdogState *s, AIOReq *aio_req)
 {
     SheepdogAIOCB *acb = aio_req->aiocb;
-    bool create = false;
+
+    aio_req->create = false;
 
     /* check whether this request becomes a CoW one */
     if (acb->aiocb_type == AIOCB_WRITE_UDATA && is_data_obj(aio_req->oid)) {
@@ -1342,17 +1347,17 @@ static void coroutine_fn resend_aioreq(BDRVSheepdogState *s, AIOReq *aio_req)
             aio_req->base_oid = vid_to_data_oid(s->inode.data_vdi_id[idx], idx);
             aio_req->flags |= SD_FLAG_CMD_COW;
         }
-        create = true;
+        aio_req->create = true;
     }
 out:
     if (is_data_obj(aio_req->oid)) {
-        add_aio_request(s, aio_req, acb->qiov->iov, acb->qiov->niov, create,
+        add_aio_request(s, aio_req, acb->qiov->iov, acb->qiov->niov,
                         acb->aiocb_type);
     } else {
         struct iovec iov;
         iov.iov_base = &s->inode;
         iov.iov_len = sizeof(s->inode);
-        add_aio_request(s, aio_req, &iov, 1, false, AIOCB_WRITE_UDATA);
+        add_aio_request(s, aio_req, &iov, 1, AIOCB_WRITE_UDATA);
     }
 }
 
@@ -1761,9 +1766,9 @@ static void coroutine_fn sd_write_done(SheepdogAIOCB *acb)
         iov.iov_base = &s->inode;
         iov.iov_len = sizeof(s->inode);
         aio_req = alloc_aio_req(s, acb, vid_to_vdi_oid(s->inode.vdi_id),
-                                data_len, offset, 0, 0, offset);
+                                data_len, offset, 0, false, 0, offset);
         QLIST_INSERT_HEAD(&s->inflight_aio_head, aio_req, aio_siblings);
-        add_aio_request(s, aio_req, &iov, 1, false, AIOCB_WRITE_UDATA);
+        add_aio_request(s, aio_req, &iov, 1, AIOCB_WRITE_UDATA);
 
         acb->aio_done_func = sd_finish_aiocb;
         acb->aiocb_type = AIOCB_WRITE_UDATA;
@@ -1954,7 +1959,8 @@ static int coroutine_fn sd_co_rw_vector(void *p)
             DPRINTF("new oid %" PRIx64 "\n", oid);
         }
 
-        aio_req = alloc_aio_req(s, acb, oid, len, offset, flags, old_oid, done);
+        aio_req = alloc_aio_req(s, acb, oid, len, offset, flags, create,
+                                old_oid, done);
         QLIST_INSERT_HEAD(&s->inflight_aio_head, aio_req, aio_siblings);
 
         if (create) {
@@ -1963,7 +1969,7 @@ static int coroutine_fn sd_co_rw_vector(void *p)
             }
         }
 
-        add_aio_request(s, aio_req, acb->qiov->iov, acb->qiov->niov, create,
+        add_aio_request(s, aio_req, acb->qiov->iov, acb->qiov->niov,
                         acb->aiocb_type);
     done:
         offset = 0;
@@ -2042,9 +2048,9 @@ static int coroutine_fn sd_co_flush_to_disk(BlockDriverState *bs)
     acb->aio_done_func = sd_finish_aiocb;
 
     aio_req = alloc_aio_req(s, acb, vid_to_vdi_oid(s->inode.vdi_id),
-                            0, 0, 0, 0, 0);
+                            0, 0, 0, false, 0, 0);
     QLIST_INSERT_HEAD(&s->inflight_aio_head, aio_req, aio_siblings);
-    add_aio_request(s, aio_req, NULL, 0, false, acb->aiocb_type);
+    add_aio_request(s, aio_req, NULL, 0, acb->aiocb_type);
 
     qemu_coroutine_yield();
     return acb->ret;
