@@ -19,7 +19,7 @@
 #include "block/block_int.h"
 #include "qemu/bitops.h"
 
-#define SD_PROTO_VER 0x01
+#define SD_PROTO_VER 0x03
 
 #define SD_DEFAULT_ADDR "localhost"
 #define SD_DEFAULT_PORT 7000
@@ -110,7 +110,7 @@ typedef struct SheepdogReq {
     uint32_t epoch;
     uint32_t id;
     uint32_t data_length;
-    uint32_t opcode_specific[8];
+    uint32_t opcode_specific[10];
 } SheepdogReq;
 
 typedef struct SheepdogRsp {
@@ -121,7 +121,7 @@ typedef struct SheepdogRsp {
     uint32_t id;
     uint32_t data_length;
     uint32_t result;
-    uint32_t opcode_specific[7];
+    uint32_t opcode_specific[9];
 } SheepdogRsp;
 
 typedef struct SheepdogObjReq {
@@ -135,8 +135,12 @@ typedef struct SheepdogObjReq {
     uint64_t cow_oid;
     uint8_t copies;
     uint8_t copy_policy;
-    uint8_t reserved[6];
+    uint8_t ec_index;
+    uint8_t reserved;
+    uint32_t tgt_epoch;
     uint64_t offset;
+    uint32_t working_vid;
+    uint32_t pad;
 } SheepdogObjReq;
 
 typedef struct SheepdogObjRsp {
@@ -150,7 +154,7 @@ typedef struct SheepdogObjRsp {
     uint8_t copies;
     uint8_t copy_policy;
     uint8_t reserved[2];
-    uint32_t pad[6];
+    uint32_t pad[8];
 } SheepdogObjRsp;
 
 typedef struct SheepdogVdiReq {
@@ -166,7 +170,7 @@ typedef struct SheepdogVdiReq {
     uint8_t copy_policy;
     uint8_t reserved[2];
     uint32_t snapid;
-    uint32_t pad[3];
+    uint32_t pad[5];
 } SheepdogVdiReq;
 
 typedef struct SheepdogVdiRsp {
@@ -179,7 +183,7 @@ typedef struct SheepdogVdiRsp {
     uint32_t result;
     uint32_t rsvd;
     uint32_t vdi_id;
-    uint32_t pad[5];
+    uint32_t pad[7];
 } SheepdogVdiRsp;
 
 typedef struct SheepdogInode {
@@ -1155,6 +1159,7 @@ static void coroutine_fn add_aio_request(BDRVSheepdogState *s, AIOReq *aio_req,
         break;
     case AIOCB_DISCARD_OBJ:
         hdr.opcode = SD_OP_DISCARD_OBJ;
+        hdr.working_vid = s->inode.vdi_id;
         break;
     }
 
