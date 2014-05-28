@@ -1073,10 +1073,10 @@ static int find_vdi_name(BDRVSheepdogState *s, const char *filename,
     unsigned int wlen, rlen = 0;
     char buf[SD_MAX_VDI_LEN + SD_MAX_VDI_TAG_LEN];
 
-    fd = connect_to_sdog(s);
-    if (fd < 0) {
-        return fd;
+    if (s->fd < 0) {
+        return s->fd;
     }
+    fd = s->fd;
 
     /* This pair of strncpy calls ensures that the buffer is zero-filled,
      * which is desirable since we'll soon be sending those bytes, and
@@ -1116,7 +1116,6 @@ static int find_vdi_name(BDRVSheepdogState *s, const char *filename,
 
     ret = 0;
 out:
-    closesocket(fd);
     return ret;
 }
 
@@ -1272,7 +1271,7 @@ static int reload_inode(BDRVSheepdogState *s, uint32_t snapid, const char *tag)
     int ret = 0, fd;
     uint32_t vid = 0;
 
-    fd = connect_to_sdog(s);
+    fd = s->fd;
     if (fd < 0) {
         return -EIO;
     }
@@ -1296,7 +1295,6 @@ static int reload_inode(BDRVSheepdogState *s, uint32_t snapid, const char *tag)
 
 out:
     g_free(inode);
-    closesocket(fd);
 
     return ret;
 }
@@ -1452,8 +1450,6 @@ static int sd_open(BlockDriverState *bs, QDict *options, int flags,
     buf = g_malloc(SD_INODE_SIZE);
     ret = read_object(fd, buf, vid_to_vdi_oid(vid), 0, SD_INODE_SIZE, 0,
                       s->cache_flags);
-
-    closesocket(fd);
 
     if (ret) {
         goto out;
@@ -1741,14 +1737,9 @@ static void sd_close(BlockDriverState *bs)
     SheepdogVdiReq hdr;
     SheepdogVdiRsp *rsp = (SheepdogVdiRsp *)&hdr;
     unsigned int wlen, rlen = 0;
-    int fd, ret;
+    int ret;
 
     DPRINTF("%s\n", s->name);
-
-    fd = connect_to_sdog(s);
-    if (fd < 0) {
-        return;
-    }
 
     memset(&hdr, 0, sizeof(hdr));
 
@@ -1758,9 +1749,7 @@ static void sd_close(BlockDriverState *bs)
     hdr.data_length = wlen;
     hdr.flags = SD_FLAG_CMD_WRITE;
 
-    ret = do_req(fd, (SheepdogReq *)&hdr, s->name, &wlen, &rlen);
-
-    closesocket(fd);
+    ret = do_req(s->fd, (SheepdogReq *)&hdr, s->name, &wlen, &rlen);
 
     if (!ret && rsp->result != SD_RES_SUCCESS &&
         rsp->result != SD_RES_VDI_NOT_LOCKED) {
