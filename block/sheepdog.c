@@ -1291,7 +1291,7 @@ static int reload_inode(BDRVSheepdogState *s, uint32_t snapid, const char *tag)
 
     inode = g_malloc(SD_INODE_HEADER_SIZE);
 
-    ret = find_vdi_name(s, s->name, snapid, tag, &vid, false, &local_err);
+    ret = find_vdi_name(s, s->name, snapid, tag, &vid, true, &local_err);
     if (ret) {
         error_report("%s", error_get_pretty(local_err));;
         error_free(local_err);
