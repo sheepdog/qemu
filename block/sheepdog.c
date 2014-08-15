@@ -2189,7 +2189,9 @@ static int sd_snapshot_create(BlockDriverState *bs, QEMUSnapshotInfo *sn_info)
     int ret, fd;
     uint32_t new_vid;
     SheepdogInode *inode;
-    unsigned int datalen;
+    unsigned int datalen, wlen, rlen;
+    SheepdogVdiReq hdr;
+    SheepdogVdiRsp *rsp = (SheepdogVdiRsp *)&hdr;
 
     DPRINTF("sn_info: name %s id_str %s s: name %s vm_state_size %" PRId64 " "
             "is_snapshot %d\n", sn_info->name, sn_info->id_str,
@@ -2229,6 +2231,23 @@ static int sd_snapshot_create(BlockDriverState *bs, QEMUSnapshotInfo *sn_info)
     if (ret < 0) {
         error_report("failed to write snapshot's inode.");
         goto cleanup;
+    }
+
+    /* release lock of the snapshot */
+    memset(&hdr, 0, sizeof(hdr));
+
+    hdr.opcode = SD_OP_RELEASE_VDI;
+    hdr.base_vdi_id = s->inode.vdi_id;
+    wlen = strlen(s->name) + 1;
+    hdr.data_length = wlen;
+    hdr.flags = SD_FLAG_CMD_WRITE;
+
+    ret = do_req(fd, s->aio_context, (SheepdogReq *)&hdr,
+                 s->name, &wlen, &rlen);
+    if (!ret && rsp->result != SD_RES_SUCCESS &&
+        rsp->result != SD_RES_VDI_NOT_LOCKED) {
+        error_report("%s, %s", sd_strerror(rsp->result), s->name);
+	goto cleanup;
     }
 
     ret = do_sd_create(s, &new_vid, 1, &local_err);
