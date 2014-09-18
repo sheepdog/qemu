@@ -1417,6 +1417,7 @@ static int sd_open(BlockDriverState *bs, QDict *options, int flags,
     QemuOpts *opts;
     Error *local_err = NULL;
     const char *filename;
+    bool lock = true;
 
     s->bs = bs;
     s->aio_context = bdrv_get_aio_context(bs);
@@ -1454,7 +1455,12 @@ static int sd_open(BlockDriverState *bs, QDict *options, int flags,
         goto out;
     }
 
-    ret = find_vdi_name(s, vdi, snapid, tag, &vid, true, errp);
+    if (!strcmp("qemu-img", error_get_progname()) ||
+        !strcmp("qemu-io", error_get_progname())) {
+        lock = false;
+    }
+
+    ret = find_vdi_name(s, vdi, snapid, tag, &vid, lock, errp);
     if (ret) {
         goto out;
     }
