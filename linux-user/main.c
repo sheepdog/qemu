@@ -33,6 +33,7 @@
 #include "qemu/timer.h"
 #include "qemu/envlist.h"
 #include "elf.h"
+#include "qemu/error-report.h"
 
 char *exec_path;
 
@@ -3835,6 +3836,7 @@ int main(int argc, char **argv, char **envp)
     int ret;
     int execfd;
 
+    error_set_progname(argv[0]);
     module_call_init(MODULE_INIT_QOM);
 
     if ((envlist = envlist_create()) == NULL) {
