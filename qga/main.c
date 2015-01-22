@@ -958,6 +958,7 @@ int main(int argc, char **argv)
     GList *blacklist = NULL;
     GAState *s;
 
+    error_set_progname(argv[0]);
     module_call_init(MODULE_INIT_QAPI);
 
     init_dfl_pathnames();
