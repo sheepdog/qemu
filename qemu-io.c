@@ -396,6 +396,7 @@ int main(int argc, char **argv)
 
     progname = basename(argv[0]);
     qemu_init_exec_dir(argv[0]);
+    error_set_progname(argv[0]);
 
     bdrv_init();
 
