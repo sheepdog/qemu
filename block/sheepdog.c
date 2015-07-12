@@ -308,8 +308,15 @@ typedef struct AIOReq {
     uint32_t id;
     bool create;
 
+    int32_t min_affect_data_idx;
+    int32_t max_affect_data_idx;
+
     QLIST_ENTRY(AIOReq) aio_siblings;
 } AIOReq;
+
+#define AIOReqsOverwrapping(x, y)                               \
+    (!(x->max_affect_data_idx < y->min_affect_data_idx          \
+       || y->max_affect_data_idx < x->min_affect_data_idx))
 
 enum AIOCBState {
     AIOCB_WRITE_UDATA,
@@ -430,7 +437,9 @@ static const char * sd_strerror(int err)
 static inline AIOReq *alloc_aio_req(BDRVSheepdogState *s, SheepdogAIOCB *acb,
                                     uint64_t oid, unsigned int data_len,
                                     uint64_t offset, uint8_t flags, bool create,
-                                    uint64_t base_oid, unsigned int iov_offset)
+                                    uint64_t base_oid, unsigned int iov_offset,
+                                    int32_t min_affect_data_idx,
+                                    int32_t max_affect_data_idx)
 {
     AIOReq *aio_req;
 
@@ -444,6 +453,8 @@ static inline AIOReq *alloc_aio_req(BDRVSheepdogState *s, SheepdogAIOCB *acb,
     aio_req->flags = flags;
     aio_req->id = s->aioreq_seq_num++;
     aio_req->create = create;
+    aio_req->min_affect_data_idx = min_affect_data_idx;
+    aio_req->max_affect_data_idx = max_affect_data_idx;
 
     acb->nr_pending++;
     return aio_req;
@@ -703,12 +714,12 @@ static int reload_inode(BDRVSheepdogState *s, uint32_t snapid, const char *tag);
 static int get_sheep_fd(BDRVSheepdogState *s, Error **errp);
 static void co_write_request(void *opaque);
 
-static AIOReq *find_pending_req(BDRVSheepdogState *s, uint64_t oid)
+static AIOReq *find_pending_req(BDRVSheepdogState *s, AIOReq *areq)
 {
     AIOReq *aio_req;
 
     QLIST_FOREACH(aio_req, &s->pending_aio_head, aio_siblings) {
-        if (aio_req->oid == oid) {
+        if (AIOReqsOverwrapping(aio_req, areq)) {
             return aio_req;
         }
     }
@@ -720,12 +731,12 @@ static AIOReq *find_pending_req(BDRVSheepdogState *s, uint64_t oid)
  * This function searchs pending requests to the object `oid', and
  * sends them.
  */
-static void coroutine_fn send_pending_req(BDRVSheepdogState *s, uint64_t oid)
+static void coroutine_fn send_pending_req(BDRVSheepdogState *s, AIOReq *areq)
 {
     AIOReq *aio_req;
     SheepdogAIOCB *acb;
 
-    while ((aio_req = find_pending_req(s, oid)) != NULL) {
+    while ((aio_req = find_pending_req(s, areq)) != NULL) {
         acb = aio_req->aiocb;
         /* move aio_req from pending list to inflight one */
         QLIST_REMOVE(aio_req, aio_siblings);
@@ -845,7 +856,7 @@ static void coroutine_fn aio_read_response(void *opaque)
              * create requests are not allowed, so we search the
              * pending requests here.
              */
-            send_pending_req(s, aio_req->oid);
+            send_pending_req(s, aio_req);
         }
         break;
     case AIOCB_READ_UDATA:
@@ -1346,13 +1357,17 @@ static bool check_simultaneous_create(BDRVSheepdogState *s, AIOReq *aio_req)
 {
     AIOReq *areq;
     QLIST_FOREACH(areq, &s->inflight_aio_head, aio_siblings) {
-        if (areq != aio_req && areq->oid == aio_req->oid) {
+        if (areq != aio_req && AIOReqsOverwrapping(aio_req, areq)) {
             /*
              * Sheepdog cannot handle simultaneous create requests to the same
              * object, so we cannot send the request until the previous request
              * finishes.
              */
-            DPRINTF("simultaneous create to %" PRIx64 "\n", aio_req->oid);
+            DPRINTF("simultaneous requests, inflight request min: %" PRIx32
+                    ", max: %" PRIx32", issued request min: %"PRIx32", max: %"
+                    PRIx32 "\n", areq->min_affect_data_idx,
+                    areq->max_affect_data_idx, aio_req->min_affect_data_idx,
+                    aio_req->max_affect_data_idx);
             aio_req->flags = 0;
             aio_req->base_oid = 0;
             aio_req->create = false;
@@ -1988,7 +2003,7 @@ static void coroutine_fn sd_write_done(SheepdogAIOCB *acb)
         iov.iov_base = &s->inode;
         iov.iov_len = sizeof(s->inode);
         aio_req = alloc_aio_req(s, acb, vid_to_vdi_oid(s->inode.vdi_id),
-                                data_len, offset, 0, false, 0, offset);
+                                data_len, offset, 0, false, 0, offset, mn, mx);
         QLIST_INSERT_HEAD(&s->inflight_aio_head, aio_req, aio_siblings);
         add_aio_request(s, aio_req, &iov, 1, AIOCB_WRITE_UDATA);
 
@@ -2121,6 +2136,7 @@ static int coroutine_fn sd_co_rw_vector(void *p)
     BDRVSheepdogState *s = acb->common.bs->opaque;
     SheepdogInode *inode = &s->inode;
     AIOReq *aio_req;
+    uint32_t min_affect_data_idx, max_affect_data_idx;
 
     if (acb->aiocb_type == AIOCB_WRITE_UDATA && s->is_snapshot) {
         /*
@@ -2137,6 +2153,10 @@ static int coroutine_fn sd_co_rw_vector(void *p)
     object_size = (UINT32_C(1) << inode->block_size_shift);
     idx = acb->sector_num * BDRV_SECTOR_SIZE / object_size;
     offset = (acb->sector_num * BDRV_SECTOR_SIZE) % object_size;
+
+    min_affect_data_idx = acb->sector_num * BDRV_SECTOR_SIZE / object_size;
+    max_affect_data_idx = (acb->sector_num * BDRV_SECTOR_SIZE +
+                           acb->nb_sectors * BDRV_SECTOR_SIZE) / object_size;
 
     /*
      * Make sure we don't free the aiocb before we are done with all requests.
@@ -2192,7 +2212,8 @@ static int coroutine_fn sd_co_rw_vector(void *p)
         }
 
         aio_req = alloc_aio_req(s, acb, oid, len, offset, flags, create,
-                                old_oid, done);
+                                old_oid, done, min_affect_data_idx,
+                                max_affect_data_idx);
         QLIST_INSERT_HEAD(&s->inflight_aio_head, aio_req, aio_siblings);
 
         if (create) {
@@ -2281,7 +2302,7 @@ static int coroutine_fn sd_co_flush_to_disk(BlockDriverState *bs)
     acb->aio_done_func = sd_finish_aiocb;
 
     aio_req = alloc_aio_req(s, acb, vid_to_vdi_oid(s->inode.vdi_id),
-                            0, 0, 0, false, 0, 0);
+                            0, 0, 0, false, 0, 0, -1, -1);
     QLIST_INSERT_HEAD(&s->inflight_aio_head, aio_req, aio_siblings);
     add_aio_request(s, aio_req, NULL, 0, acb->aiocb_type);
 
