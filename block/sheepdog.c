@@ -326,6 +326,9 @@ struct SheepdogAIOCB {
     int64_t sector_num;
     int nb_sectors;
 
+    uint32_t min_affect_data_idx;
+    uint32_t max_affect_data_idx;
+
     int ret;
     enum AIOCBState aiocb_type;
 
@@ -334,7 +337,13 @@ struct SheepdogAIOCB {
 
     bool cancelable;
     int nr_pending;
+
+    QLIST_ENTRY(SheepdogAIOCB) aiocb_siblings;
 };
+
+#define AIOCBOverwrapping(x, y)                                 \
+    (!(x->max_affect_data_idx < y->min_affect_data_idx          \
+       || y->max_affect_data_idx < x->min_affect_data_idx))
 
 typedef struct BDRVSheepdogState {
     BlockDriverState *bs;
@@ -364,6 +373,9 @@ typedef struct BDRVSheepdogState {
     QLIST_HEAD(inflight_aio_head, AIOReq) inflight_aio_head;
     QLIST_HEAD(pending_aio_head, AIOReq) pending_aio_head;
     QLIST_HEAD(failed_aio_head, AIOReq) failed_aio_head;
+
+    QLIST_HEAD(inflight_aiocb_head, SheepdogAIOCB) inflight_aiocb_head;
+    QLIST_HEAD(pending_aiocb_head, SheepdogAIOCB) pending_aiocb_head;
 } BDRVSheepdogState;
 
 static const char * sd_strerror(int err)
@@ -462,6 +474,7 @@ static inline void free_aio_req(BDRVSheepdogState *s, AIOReq *aio_req)
 
 static void coroutine_fn sd_finish_aiocb(SheepdogAIOCB *acb)
 {
+    QLIST_REMOVE(acb, aiocb_siblings);
     qemu_coroutine_enter(acb->coroutine, NULL);
     qemu_aio_unref(acb);
 }
@@ -529,6 +542,9 @@ static SheepdogAIOCB *sd_aio_setup(BlockDriverState *bs, QEMUIOVector *qiov,
                                    int64_t sector_num, int nb_sectors)
 {
     SheepdogAIOCB *acb;
+    BDRVSheepdogState *s = bs->opaque;
+    SheepdogInode *inode = &s->inode;
+    uint32_t object_size = (UINT32_C(1) << inode->block_size_shift);
 
     acb = qemu_aio_get(&sd_aiocb_info, bs, NULL, NULL);
 
@@ -542,6 +558,11 @@ static SheepdogAIOCB *sd_aio_setup(BlockDriverState *bs, QEMUIOVector *qiov,
     acb->coroutine = qemu_coroutine_self();
     acb->ret = 0;
     acb->nr_pending = 0;
+
+    acb->min_affect_data_idx = acb->sector_num * BDRV_SECTOR_SIZE / object_size;
+    acb->max_affect_data_idx = (acb->sector_num * BDRV_SECTOR_SIZE +
+                              acb->nb_sectors * BDRV_SECTOR_SIZE) / object_size;
+
     return acb;
 }
 
@@ -1460,6 +1481,9 @@ static int sd_open(BlockDriverState *bs, QDict *options, int flags,
     QLIST_INIT(&s->inflight_aio_head);
     QLIST_INIT(&s->pending_aio_head);
     QLIST_INIT(&s->failed_aio_head);
+
+    QLIST_INIT(&s->inflight_aiocb_head);
+    QLIST_INIT(&s->pending_aiocb_head);
     s->fd = -1;
 
     memset(vdi, 0, sizeof(vdi));
@@ -1526,6 +1550,7 @@ static int sd_open(BlockDriverState *bs, QDict *options, int flags,
     qemu_co_mutex_init(&s->lock);
     qemu_opts_del(opts);
     g_free(buf);
+
     return 0;
 out:
     aio_set_fd_handler(bdrv_get_aio_context(bs), s->fd, NULL, NULL, NULL);
@@ -2215,6 +2240,25 @@ out:
     return 1;
 }
 
+static bool check_simultaneous_aio(BDRVSheepdogState *s, SheepdogAIOCB *aiocb)
+{
+    SheepdogAIOCB *cb;
+    QLIST_FOREACH(cb, &s->inflight_aiocb_head, aiocb_siblings) {
+        if (AIOCBOverwrapping(aiocb, cb)) {
+            /*
+             * Sheepdog cannot handle simultaneous create requests to the same
+             * object, so we cannot send the request until the previous request
+             * finishes.
+             */
+            QLIST_REMOVE(aiocb, aiocb_siblings);
+            QLIST_INSERT_HEAD(&s->pending_aiocb_head, aiocb, aiocb_siblings);
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static coroutine_fn int sd_co_writev(BlockDriverState *bs, int64_t sector_num,
                         int nb_sectors, QEMUIOVector *qiov)
 {
@@ -2234,8 +2278,18 @@ static coroutine_fn int sd_co_writev(BlockDriverState *bs, int64_t sector_num,
     acb->aio_done_func = sd_write_done;
     acb->aiocb_type = AIOCB_WRITE_UDATA;
 
+retry:
+    if (check_simultaneous_aio(s, acb)) {
+        qemu_coroutine_yield();
+        QLIST_REMOVE(acb, aiocb_siblings);
+	goto retry;
+    }
+
+    QLIST_INSERT_HEAD(&s->inflight_aiocb_head, acb, aiocb_siblings);
+
     ret = sd_co_rw_vector(acb);
     if (ret <= 0) {
+        QLIST_REMOVE(acb, aiocb_siblings);
         qemu_aio_unref(acb);
         return ret;
     }
@@ -2250,19 +2304,28 @@ static coroutine_fn int sd_co_readv(BlockDriverState *bs, int64_t sector_num,
 {
     SheepdogAIOCB *acb;
     int ret;
+    BDRVSheepdogState *s = bs->opaque;
 
     acb = sd_aio_setup(bs, qiov, sector_num, nb_sectors);
     acb->aiocb_type = AIOCB_READ_UDATA;
     acb->aio_done_func = sd_finish_aiocb;
 
+retry:
+    if (check_simultaneous_aio(s, acb)) {
+        qemu_coroutine_yield();
+        QLIST_REMOVE(acb, aiocb_siblings);
+	goto retry;
+    }
+
+    QLIST_INSERT_HEAD(&s->inflight_aiocb_head, acb, aiocb_siblings);
     ret = sd_co_rw_vector(acb);
     if (ret <= 0) {
+        QLIST_REMOVE(acb, aiocb_siblings);
         qemu_aio_unref(acb);
         return ret;
     }
 
     qemu_coroutine_yield();
-
     return acb->ret;
 }
 
