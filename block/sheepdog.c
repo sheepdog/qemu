@@ -318,6 +318,10 @@ enum AIOCBState {
     AIOCB_DISCARD_OBJ,
 };
 
+#define AIOCBOverwrapping(x, y)                                 \
+    (!(x->max_affect_data_idx < y->min_affect_data_idx          \
+       || y->max_affect_data_idx < x->min_affect_data_idx))
+
 struct SheepdogAIOCB {
     BlockAIOCB common;
 
@@ -334,6 +338,11 @@ struct SheepdogAIOCB {
 
     bool cancelable;
     int nr_pending;
+
+    uint32_t min_affect_data_idx;
+    uint32_t max_affect_data_idx;
+
+    QLIST_ENTRY(SheepdogAIOCB) aiocb_siblings;
 };
 
 typedef struct BDRVSheepdogState {
@@ -364,6 +373,9 @@ typedef struct BDRVSheepdogState {
     QLIST_HEAD(inflight_aio_head, AIOReq) inflight_aio_head;
     QLIST_HEAD(pending_aio_head, AIOReq) pending_aio_head;
     QLIST_HEAD(failed_aio_head, AIOReq) failed_aio_head;
+
+    CoQueue overwrapping_queue;
+    QLIST_HEAD(inflight_aiocb_head, SheepdogAIOCB) inflight_aiocb_head;
 } BDRVSheepdogState;
 
 static const char * sd_strerror(int err)
@@ -529,6 +541,10 @@ static SheepdogAIOCB *sd_aio_setup(BlockDriverState *bs, QEMUIOVector *qiov,
                                    int64_t sector_num, int nb_sectors)
 {
     SheepdogAIOCB *acb;
+    uint32_t object_size;
+    BDRVSheepdogState *s = bs->opaque;
+
+    object_size = (UINT32_C(1) << s->inode.block_size_shift);
 
     acb = qemu_aio_get(&sd_aiocb_info, bs, NULL, NULL);
 
@@ -542,6 +558,11 @@ static SheepdogAIOCB *sd_aio_setup(BlockDriverState *bs, QEMUIOVector *qiov,
     acb->coroutine = qemu_coroutine_self();
     acb->ret = 0;
     acb->nr_pending = 0;
+
+    acb->min_affect_data_idx = acb->sector_num * BDRV_SECTOR_SIZE / object_size;
+    acb->max_affect_data_idx = (acb->sector_num * BDRV_SECTOR_SIZE +
+                              acb->nb_sectors * BDRV_SECTOR_SIZE) / object_size;
+
     return acb;
 }
 
@@ -1460,6 +1481,7 @@ static int sd_open(BlockDriverState *bs, QDict *options, int flags,
     QLIST_INIT(&s->inflight_aio_head);
     QLIST_INIT(&s->pending_aio_head);
     QLIST_INIT(&s->failed_aio_head);
+    QLIST_INIT(&s->inflight_aiocb_head);
     s->fd = -1;
 
     memset(vdi, 0, sizeof(vdi));
@@ -1524,6 +1546,7 @@ static int sd_open(BlockDriverState *bs, QDict *options, int flags,
     bs->total_sectors = s->inode.vdi_size / BDRV_SECTOR_SIZE;
     pstrcpy(s->name, sizeof(s->name), vdi);
     qemu_co_mutex_init(&s->lock);
+    qemu_co_queue_init(&s->overwrapping_queue);
     qemu_opts_del(opts);
     g_free(buf);
     return 0;
@@ -2215,6 +2238,20 @@ out:
     return 1;
 }
 
+static bool check_overwrapping_aiocb(BDRVSheepdogState *s, SheepdogAIOCB *aiocb)
+{
+    SheepdogAIOCB *cb;
+
+    QLIST_FOREACH(cb, &s->inflight_aiocb_head, aiocb_siblings) {
+        if (AIOCBOverwrapping(aiocb, cb)) {
+            return true;
+        }
+    }
+
+    QLIST_INSERT_HEAD(&s->inflight_aiocb_head, aiocb, aiocb_siblings);
+    return false;
+}
+
 static coroutine_fn int sd_co_writev(BlockDriverState *bs, int64_t sector_num,
                         int nb_sectors, QEMUIOVector *qiov)
 {
@@ -2234,13 +2271,25 @@ static coroutine_fn int sd_co_writev(BlockDriverState *bs, int64_t sector_num,
     acb->aio_done_func = sd_write_done;
     acb->aiocb_type = AIOCB_WRITE_UDATA;
 
+retry:
+    if (check_overwrapping_aiocb(s, acb)) {
+        qemu_co_queue_wait(&s->overwrapping_queue);
+
+        goto retry;
+    }
+
     ret = sd_co_rw_vector(acb);
     if (ret <= 0) {
+        QLIST_REMOVE(acb, aiocb_siblings);
+        qemu_co_queue_restart_all(&s->overwrapping_queue);
         qemu_aio_unref(acb);
         return ret;
     }
 
     qemu_coroutine_yield();
+
+    QLIST_REMOVE(acb, aiocb_siblings);
+    qemu_co_queue_restart_all(&s->overwrapping_queue);
 
     return acb->ret;
 }
@@ -2250,19 +2299,31 @@ static coroutine_fn int sd_co_readv(BlockDriverState *bs, int64_t sector_num,
 {
     SheepdogAIOCB *acb;
     int ret;
+    BDRVSheepdogState *s = bs->opaque;
 
     acb = sd_aio_setup(bs, qiov, sector_num, nb_sectors);
     acb->aiocb_type = AIOCB_READ_UDATA;
     acb->aio_done_func = sd_finish_aiocb;
 
+retry:
+    if (check_overwrapping_aiocb(s, acb)) {
+        qemu_co_queue_wait(&s->overwrapping_queue);
+
+        goto retry;
+    }
+
     ret = sd_co_rw_vector(acb);
     if (ret <= 0) {
+        QLIST_REMOVE(acb, aiocb_siblings);
+        qemu_co_queue_restart_all(&s->overwrapping_queue);
         qemu_aio_unref(acb);
         return ret;
     }
 
     qemu_coroutine_yield();
 
+    QLIST_REMOVE(acb, aiocb_siblings);
+    qemu_co_queue_restart_all(&s->overwrapping_queue);
     return acb->ret;
 }
 
