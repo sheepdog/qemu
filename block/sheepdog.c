@@ -342,6 +342,15 @@ struct SheepdogAIOCB {
     uint32_t min_affect_data_idx;
     uint32_t max_affect_data_idx;
 
+    /*
+     * The difference between affect_data_idx and dirty_data_idx:
+     * affect_data_idx represents range of index of all request types.
+     * dirty_data_idx represents range of index updated by COW requests.
+     * dirty_data_idx is used for updating an inode object.
+     */
+    uint32_t min_dirty_data_idx;
+    uint32_t max_dirty_data_idx;
+
     QLIST_ENTRY(SheepdogAIOCB) aiocb_siblings;
 };
 
@@ -350,9 +359,6 @@ typedef struct BDRVSheepdogState {
     AioContext *aio_context;
 
     SheepdogInode inode;
-
-    uint32_t min_dirty_data_idx;
-    uint32_t max_dirty_data_idx;
 
     char name[SD_MAX_VDI_LEN];
     bool is_snapshot;
@@ -555,6 +561,9 @@ static SheepdogAIOCB *sd_aio_setup(BlockDriverState *bs, QEMUIOVector *qiov,
     acb->min_affect_data_idx = acb->sector_num * BDRV_SECTOR_SIZE / object_size;
     acb->max_affect_data_idx = (acb->sector_num * BDRV_SECTOR_SIZE +
                               acb->nb_sectors * BDRV_SECTOR_SIZE) / object_size;
+
+    acb->min_dirty_data_idx = UINT32_MAX;
+    acb->max_dirty_data_idx = 0;
 
     return acb;
 }
@@ -819,8 +828,8 @@ static void coroutine_fn aio_read_response(void *opaque)
              */
             if (rsp.result == SD_RES_SUCCESS) {
                 s->inode.data_vdi_id[idx] = s->inode.vdi_id;
-                s->max_dirty_data_idx = MAX(idx, s->max_dirty_data_idx);
-                s->min_dirty_data_idx = MIN(idx, s->min_dirty_data_idx);
+                acb->max_dirty_data_idx = MAX(idx, acb->max_dirty_data_idx);
+                acb->min_dirty_data_idx = MIN(idx, acb->min_dirty_data_idx);
             }
         }
         break;
@@ -1466,8 +1475,6 @@ static int sd_open(BlockDriverState *bs, QDict *options, int flags,
     }
 
     memcpy(&s->inode, buf, sizeof(s->inode));
-    s->min_dirty_data_idx = UINT32_MAX;
-    s->max_dirty_data_idx = 0;
 
     bs->total_sectors = s->inode.vdi_size / BDRV_SECTOR_SIZE;
     pstrcpy(s->name, sizeof(s->name), vdi);
@@ -1923,16 +1930,16 @@ static void coroutine_fn sd_write_done(SheepdogAIOCB *acb)
     AIOReq *aio_req;
     uint32_t offset, data_len, mn, mx;
 
-    mn = s->min_dirty_data_idx;
-    mx = s->max_dirty_data_idx;
+    mn = acb->min_dirty_data_idx;
+    mx = acb->max_dirty_data_idx;
     if (mn <= mx) {
         /* we need to update the vdi object. */
         offset = sizeof(s->inode) - sizeof(s->inode.data_vdi_id) +
             mn * sizeof(s->inode.data_vdi_id[0]);
         data_len = (mx - mn + 1) * sizeof(s->inode.data_vdi_id[0]);
 
-        s->min_dirty_data_idx = UINT32_MAX;
-        s->max_dirty_data_idx = 0;
+        acb->min_dirty_data_idx = UINT32_MAX;
+        acb->max_dirty_data_idx = 0;
 
         iov.iov_base = &s->inode;
         iov.iov_len = sizeof(s->inode);
