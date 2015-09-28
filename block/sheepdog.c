@@ -382,6 +382,7 @@ typedef struct BDRVSheepdogState {
     QLIST_HEAD(inflight_aiocb_head, SheepdogAIOCB) inflight_aiocb_head;
 
     bool reconnection;
+    bool reload_retry;
 } BDRVSheepdogState;
 
 typedef struct BDRVSheepdogReopenState {
@@ -1318,10 +1319,18 @@ static int reload_inode(BDRVSheepdogState *s, uint32_t snapid, const char *tag)
         goto out;
     }
 
+retry:
     ret = read_object(fd, s->aio_context, (char *)inode, vid_to_vdi_oid(vid),
                       s->inode.nr_copies, SD_INODE_HEADER_SIZE, 0,
                       s->cache_flags);
-    if (ret < 0) {
+    if (ret == SD_RES_NO_OBJ && s->reload_retry) {
+        /*
+         * sheepdog doesn't have a metadata transaction mechanism, so the qemu
+         * driver can see inconsistent state like a working VDI became snapshot
+         * but an inode object of new working VDI isn't created yet
+         */
+        goto retry;
+    } else if (ret < 0) {
         goto out;
     }
 
@@ -1399,6 +1408,11 @@ static QemuOptsList runtime_opts = {
             .type = QEMU_OPT_BOOL,
             .help = "on/off reconnection (default: on)",
         },
+        {
+            .name = "reload-retry",
+            .type = QEMU_OPT_BOOL,
+            .help = "on/off retrying inode reload (default: off)",
+        },
         { /* end of list */ }
     },
 };
@@ -1428,6 +1442,7 @@ static int sd_open(BlockDriverState *bs, QDict *options, int flags,
     }
 
     s->reconnection = qemu_opt_get_bool(opts, "reconnection", true);
+    s->reload_retry = qemu_opt_get_bool(opts, "reload-retry", false);
     filename = qemu_opt_get(opts, "filename");
 
     QLIST_INIT(&s->inflight_aio_head);
