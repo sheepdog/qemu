@@ -380,6 +380,8 @@ typedef struct BDRVSheepdogState {
 
     CoQueue overlapping_queue;
     QLIST_HEAD(inflight_aiocb_head, SheepdogAIOCB) inflight_aiocb_head;
+
+    bool reconnection;
 } BDRVSheepdogState;
 
 typedef struct BDRVSheepdogReopenState {
@@ -902,7 +904,9 @@ out:
     return;
 err:
     s->co_recv = NULL;
-    reconnect_to_sdog(opaque);
+    if (s->reconnection) {
+        reconnect_to_sdog(opaque);
+    }
 }
 
 static void co_read_response(void *opaque)
@@ -1390,6 +1394,11 @@ static QemuOptsList runtime_opts = {
             .type = QEMU_OPT_STRING,
             .help = "URL to the sheepdog image",
         },
+        {
+            .name = "reconnection",
+            .type = QEMU_OPT_BOOL,
+            .help = "on/off reconnection (default: on)",
+        },
         { /* end of list */ }
     },
 };
@@ -1418,6 +1427,7 @@ static int sd_open(BlockDriverState *bs, QDict *options, int flags,
         goto out;
     }
 
+    s->reconnection = qemu_opt_get_bool(opts, "reconnection", true);
     filename = qemu_opt_get(opts, "filename");
 
     QLIST_INIT(&s->inflight_aio_head);
