@@ -283,6 +283,12 @@ static inline bool is_snapshot(struct SheepdogInode *inode)
     return !!inode->snap_ctime;
 }
 
+static inline size_t count_data_objs(const struct SheepdogInode *inode)
+{
+    return DIV_ROUND_UP(inode->vdi_size,
+                        (1UL << inode->block_size_shift));
+}
+
 #undef DPRINTF
 #ifdef DEBUG_SDOG
 #define DPRINTF(fmt, args...)                                       \
@@ -292,6 +298,8 @@ static inline bool is_snapshot(struct SheepdogInode *inode)
 #else
 #define DPRINTF(fmt, args...)
 #endif
+
+#define NR_BATCHED_DISCARD 128
 
 typedef struct SheepdogAIOCB SheepdogAIOCB;
 
@@ -2033,6 +2041,55 @@ static void coroutine_fn sd_write_done(SheepdogAIOCB *acb)
     }
 
     sd_finish_aiocb(acb);
+}
+
+static bool remove_objects(BDRVSheepdogState *s)
+{
+    int fd, i = 0, nr_objs = 0;
+    Error *local_err = NULL;
+    bool ret = true;
+    SheepdogInode *inode = &s->inode;
+
+    fd = connect_to_sdog(s, &local_err);
+    if (fd < 0) {
+        error_report_err(local_err);
+        return false;
+    }
+
+    while (i < nr_objs) {
+        int start_idx, nr_filled_idx;
+
+        while (i < nr_objs && !inode->data_vdi_id[i]) {
+            i++;
+        }
+        start_idx = i;
+
+        nr_filled_idx = 0;
+        while (i < nr_objs && nr_filled_idx < NR_BATCHED_DISCARD) {
+            if (inode->data_vdi_id[i]) {
+                inode->data_vdi_id[i] = 0;
+                nr_filled_idx++;
+            }
+
+            i++;
+        }
+
+        ret = write_object(fd, s->aio_context,
+                           (char *)&inode->data_vdi_id[start_idx],
+                           vid_to_vdi_oid(s->inode.vdi_id), inode->nr_copies,
+                           (i - start_idx) * sizeof(uint32_t),
+                           offsetof(struct SheepdogInode,
+                                    data_vdi_id[start_idx]),
+                           false, true);
+        if (ret) {
+            ret = false;
+            goto out;
+        }
+    }
+
+out:
+    closesocket(fd);
+    return ret;
 }
 
 /* Delete current working VDI on the snapshot chain */
